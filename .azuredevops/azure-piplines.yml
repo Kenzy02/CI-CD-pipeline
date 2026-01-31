@@ -1,0 +1,89 @@
+# azure-pipelines.yml
+trigger:
+  branches:
+    include:
+    - main
+
+parameters:
+- name: deployTarget
+  displayName: 'Deployment Target'
+  type: string
+  default: 'local'
+  values:
+  - 'local'
+  - 'ec2'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  imageName: '$(DOCKERHUB_USERNAME)/$(Build.Repository.Name)'
+  imageTag: '$(imageName):$(Build.BuildId)'
+
+stages:
+- stage: Build_and_Scan
+  displayName: 'Build and Scan'
+  jobs:
+  - job: Build_Scan
+    displayName: 'Build Docker Image and Scan with Trivy'
+    steps:
+    - task: Docker@2
+      displayName: 'Build Docker Image'
+      inputs:
+        containerRegistry: 'dockerhub'
+        repository: '$(Build.Repository.Name)'
+        command: 'buildAndPush'
+        tags: |
+          $(Build.BuildId)
+          latest
+        dockerFile: '**/Dockerfile'
+
+    - script: |
+        wget https://github.com/aquasecurity/trivy/releases/latest/download/trivy_0.52.1_Linux-64bit.tar.gz
+        tar zxvf trivy_0.52.1_Linux-64bit.tar.gz trivy
+        sudo mv trivy /usr/local/bin/
+      displayName: 'Install Trivy'
+
+    - script: |
+        trivy image --exit-code 0 --severity HIGH,CRITICAL \
+          --format template --template "@contrib/html.tpl" \
+          -o $(Build.ArtifactStagingDirectory)/trivy-report.html $(imageTag)
+      displayName: 'Scan Image with Trivy'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Trivy Report'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)/trivy-report.html'
+        ArtifactName: 'trivy-report'
+        publishLocation: 'Container'
+
+    - script: |
+        trivy image --exit-code 1 --severity HIGH,CRITICAL $(imageTag)
+      displayName: 'Fail on Critical/High Vulnerabilities'
+
+- stage: Deploy
+  displayName: 'Deploy Application'
+  dependsOn: Build_and_Scan
+  condition: succeeded()
+  jobs:
+  - job: Deploy_App
+    displayName: 'Deploy to $(deployTarget)'
+    strategy:
+      matrix:
+        local:
+          target: 'local'
+        ec2:
+          target: 'ec2'
+      maxParallel: 1
+    steps:
+    - checkout: self
+
+    - script: |
+        chmod +x ./deployment/$(target)-deploy.sh
+        ./deployment/$(target)-deploy.sh $(imageTag)
+      displayName: 'Deploy Application'
+      env:
+        AWS_ACCESS_KEY_ID: $(AWS_ACCESS_KEY_ID)
+        AWS_SECRET_ACCESS_KEY: $(AWS_SECRET_ACCESS_KEY)
+        EC2_HOST: $(EC2_HOST)
+      condition: eq(variables['target'], parameters.deployTarget)
